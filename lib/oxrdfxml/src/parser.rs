@@ -859,7 +859,9 @@ impl<R> InternalRdfXmlParser<R> {
     }
 
     fn parse_doctype(&mut self, dt: &BytesText<'_>) -> Result<(), RdfXmlParseError> {
-        // we extract entities
+        // Entity values with character references resolved; their entity references are expanded
+        // once all declarations are known, so a value may refer to an entity declared after it.
+        let mut declared: Vec<(String, String)> = Vec::new();
         for input in self
             .reader
             .decoder()
@@ -886,12 +888,22 @@ impl<R> InternalRdfXmlParser<R> {
                     RdfXmlSyntaxError::msg("<!ENTITY declarations values should end with >")
                 })?;
 
-                // Resolves custom entities within the current entity definition.
+                // Entity references stay as they are: they are bypassed in an entity value.
+                let references: HashMap<&str, String> = entity_references(entity_value)
+                    .map(|name| (name, format!("&{name};")))
+                    .collect();
                 let entity_value =
-                    unescape_with(entity_value, |e| self.resolve_entity(e)).map_err(Error::from)?;
-                self.custom_entities
-                    .insert(entity_name.to_owned(), entity_value.to_string());
+                    unescape_with(entity_value, |e| references.get(e).map(String::as_str))
+                        .map_err(Error::from)?;
+                if !declared.iter().any(|(name, _)| name == entity_name) {
+                    declared.push((entity_name.to_owned(), entity_value.into_owned()));
+                }
             }
+        }
+        for (name, _) in &declared {
+            // An entity that refers to itself or to an undeclared entity stays unknown, so
+            // using it is an error.
+            expand_entity(name, &declared, &mut self.custom_entities, &mut Vec::new());
         }
         Ok(())
     }
@@ -2076,6 +2088,55 @@ impl<R> InternalRdfXmlParser<R> {
     }
 }
 
+/// The names of the entity references (`&name;`, not character references) in `value`.
+fn entity_references(value: &str) -> impl Iterator<Item = &str> {
+    value.split('&').skip(1).filter_map(|after| {
+        let name = &after[..after.find(';')?];
+        (!name.starts_with('#')).then_some(name)
+    })
+}
+
+/// Expands the entity `name` of `declared` into `expanded`, with the entities it refers to;
+/// `false` if it refers to itself, to an undeclared entity or grows too large.
+fn expand_entity(
+    name: &str,
+    declared: &[(String, String)],
+    expanded: &mut HashMap<String, String>,
+    visiting: &mut Vec<String>,
+) -> bool {
+    /// The largest replacement text of an entity, against exponential expansion.
+    const MAX_ENTITY_SIZE: usize = 1024 * 1024;
+    if expanded.contains_key(name) {
+        return true;
+    }
+    let Some((_, value)) = declared.iter().find(|(n, _)| n == name) else {
+        return false;
+    };
+    if visiting.iter().any(|n| n == name) {
+        return false;
+    }
+    visiting.push(name.to_owned());
+    let complete = entity_references(value).all(|reference| {
+        resolve_xml_entity(reference).is_some()
+            || expand_entity(reference, declared, expanded, visiting)
+    });
+    visiting.pop();
+    if !complete {
+        return false;
+    }
+    let Ok(value) = unescape_with(value, |e| {
+        resolve_xml_entity(e).or_else(|| expanded.get(e).map(String::as_str))
+    }) else {
+        return false;
+    };
+    if value.len() > MAX_ENTITY_SIZE {
+        return false;
+    }
+    let value = value.into_owned();
+    expanded.insert(name.to_owned(), value);
+    true
+}
+
 fn is_object_defined(object: &Option<NodeOrText>) -> bool {
     match object {
         Some(NodeOrText::Node(_)) => true,
@@ -2127,5 +2188,70 @@ impl RdfVersion {
                 "The rdf:version value '{value}' is not supported, allowed values are '1.1' and '1.2'"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(xml: &str) -> Result<Vec<Triple>, RdfXmlSyntaxError> {
+        RdfXmlParser::new().for_slice(xml).collect()
+    }
+
+    #[test]
+    fn entity_may_refer_to_a_later_entity() {
+        let triples = parse(
+            r#"<?xml version="1.0"?>
+<!DOCTYPE rdf:RDF [
+  <!ENTITY a "&b;a">
+  <!ENTITY b "http://example.com/">
+]>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="&a;"><rdf:value>&a;</rdf:value></rdf:Description>
+</rdf:RDF>"#,
+        )
+        .unwrap();
+        assert_eq!(triples.len(), 1);
+        assert_eq!(
+            triples[0].subject,
+            NamedNode::new_unchecked("http://example.com/a").into()
+        );
+        assert_eq!(
+            triples[0].object,
+            Literal::new_simple_literal("http://example.com/a").into()
+        );
+    }
+
+    #[test]
+    fn recursive_entity_is_an_error_when_used() {
+        parse(
+            r#"<!DOCTYPE rdf:RDF [
+  <!ENTITY a "&b;">
+  <!ENTITY b "&a;">
+]>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="http://example.com/s"><rdf:value>&a;</rdf:value></rdf:Description>
+</rdf:RDF>"#,
+        )
+        .unwrap_err();
+    }
+
+    #[test]
+    fn first_entity_declaration_is_binding() {
+        let triples = parse(
+            r#"<!DOCTYPE rdf:RDF [
+  <!ENTITY a "first">
+  <!ENTITY a "second">
+]>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="http://example.com/s"><rdf:value>&a;</rdf:value></rdf:Description>
+</rdf:RDF>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            triples[0].object,
+            Literal::new_simple_literal("first").into()
+        );
     }
 }
