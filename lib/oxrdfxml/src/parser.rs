@@ -900,11 +900,7 @@ impl<R> InternalRdfXmlParser<R> {
                 }
             }
         }
-        for (name, _) in &declared {
-            // An entity that refers to itself or to an undeclared entity stays unknown, so
-            // using it is an error.
-            expand_entity(name, &declared, &mut self.custom_entities, &mut Vec::new());
-        }
+        self.custom_entities = expand_entities(&declared);
         Ok(())
     }
 
@@ -2096,45 +2092,81 @@ fn entity_references(value: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-/// Expands the entity `name` of `declared` into `expanded`, with the entities it refers to;
-/// `false` if it refers to itself, to an undeclared entity or grows too large.
-fn expand_entity(
-    name: &str,
-    declared: &[(String, String)],
-    expanded: &mut HashMap<String, String>,
-    visiting: &mut Vec<String>,
-) -> bool {
-    /// The largest replacement text of an entity, against exponential expansion.
-    const MAX_ENTITY_SIZE: usize = 1024 * 1024;
-    if expanded.contains_key(name) {
-        return true;
-    }
-    let Some((_, value)) = declared.iter().find(|(n, _)| n == name) else {
-        return false;
+/// The longest replacement text of an entity.
+const MAX_ENTITY_SIZE: usize = 1024 * 1024;
+/// The longest replacement texts of all entities together, against exponential expansion.
+const MAX_ENTITIES_SIZE: usize = 16 * 1024 * 1024;
+/// The longest chain of entities referring to each other.
+const MAX_ENTITY_DEPTH: usize = 64;
+
+/// The entities of `declared` (in declaration order) with their entity references expanded.
+/// An entity that refers to itself, to an undeclared entity, or whose expansion is too long or
+/// too deep is left out, so using it is an error. Entities are expanded in dependency order,
+/// without recursion, and among the ready ones in declaration order, so that the limits always
+/// leave out the same entities.
+fn expand_entities(declared: &[(String, String)]) -> HashMap<String, String> {
+    let references = |value: &str| -> Vec<String> {
+        let mut names: Vec<String> = entity_references(value)
+            .filter(|name| resolve_xml_entity(name).is_none())
+            .map(str::to_owned)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
     };
-    if visiting.iter().any(|n| n == name) {
-        return false;
+    let mut waiting = vec![0; declared.len()];
+    let mut dependents: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut ready = std::collections::BTreeSet::new();
+    for (i, (_, value)) in declared.iter().enumerate() {
+        let names = references(value);
+        waiting[i] = names.len();
+        if names.is_empty() {
+            ready.insert(i);
+        }
+        for name in names {
+            dependents.entry(name).or_default().push(i);
+        }
     }
-    visiting.push(name.to_owned());
-    let complete = entity_references(value).all(|reference| {
-        resolve_xml_entity(reference).is_some()
-            || expand_entity(reference, declared, expanded, visiting)
-    });
-    visiting.pop();
-    if !complete {
-        return false;
+    let mut expanded: HashMap<String, String> = HashMap::new();
+    let mut depth: HashMap<&str, usize> = HashMap::new();
+    let mut total = 0;
+    while let Some(i) = ready.pop_first() {
+        let (name, value) = &declared[i];
+        let names = references(value);
+        // The size is known before the text is built: the value plus what each reference stands for.
+        let all_known = names.iter().all(|n| expanded.contains_key(n));
+        let size = value.len()
+            + entity_references(value)
+                .map(|n| expanded.get(n).map_or(0, String::len))
+                .sum::<usize>();
+        let own_depth = 1 + names
+            .iter()
+            .map(|n| depth.get(n.as_str()).copied().unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+        if all_known
+            && size <= MAX_ENTITY_SIZE
+            && total + size <= MAX_ENTITIES_SIZE
+            && own_depth <= MAX_ENTITY_DEPTH
+        {
+            if let Ok(text) = unescape_with(value, |e| {
+                resolve_xml_entity(e).or_else(|| expanded.get(e).map(String::as_str))
+            }) {
+                let text = text.into_owned();
+                total += text.len();
+                expanded.insert(name.clone(), text);
+                depth.insert(name, own_depth);
+            }
+        }
+        // Dependents of an entity left out are left out too: they wait on it no more, but miss it.
+        for &dependent in dependents.get(name).into_iter().flatten() {
+            waiting[dependent] -= 1;
+            if waiting[dependent] == 0 {
+                ready.insert(dependent);
+            }
+        }
     }
-    let Ok(value) = unescape_with(value, |e| {
-        resolve_xml_entity(e).or_else(|| expanded.get(e).map(String::as_str))
-    }) else {
-        return false;
-    };
-    if value.len() > MAX_ENTITY_SIZE {
-        return false;
-    }
-    let value = value.into_owned();
-    expanded.insert(name.to_owned(), value);
-    true
+    expanded
 }
 
 fn is_object_defined(object: &Option<NodeOrText>) -> bool {
@@ -2235,6 +2267,28 @@ mod tests {
 </rdf:RDF>"#,
         )
         .unwrap_err();
+    }
+
+    #[test]
+    fn entity_expansion_is_bounded() {
+        let parse_with = |dtd: &str, name: &str| {
+            parse(&format!(
+                r#"<!DOCTYPE rdf:RDF [{dtd}]>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="http://example.com/s"><rdf:value>&{name};</rdf:value></rdf:Description>
+</rdf:RDF>"#
+            ))
+        };
+        let chain: String = std::iter::once("<!ENTITY e0 \"x\">".to_owned())
+            .chain((1..10_000).map(|i| format!("<!ENTITY e{i} \"&e{};\">", i - 1)))
+            .collect();
+        parse_with(&chain, "e1").unwrap();
+        parse_with(&chain, "e9999").unwrap_err();
+        let fan: String = std::iter::once("<!ENTITY f0 \"0123456789\">".to_owned())
+            .chain((1..40).map(|i| format!("<!ENTITY f{i} \"&f{0};&f{0};\">", i - 1)))
+            .collect();
+        parse_with(&fan, "f1").unwrap();
+        parse_with(&fan, "f39").unwrap_err();
     }
 
     #[test]
