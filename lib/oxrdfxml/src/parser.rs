@@ -920,32 +920,46 @@ impl<R> InternalRdfXmlParser<R> {
         }
 
         // Literal case
-        if let Some(RdfXmlState::ParseTypeLiteralPropertyElt { writer, .. }) = self.state.last_mut()
-        {
-            let mut clean_event = BytesStart::new(
-                self.reader
-                    .decoder()
-                    .decode(event.name().as_ref())?
-                    .to_string(),
-            );
+        if matches!(
+            self.state.last(),
+            Some(RdfXmlState::ParseTypeLiteralPropertyElt { .. })
+        ) {
+            let decoder = self.reader.decoder();
+            let mut clean_event =
+                BytesStart::new(decoder.decode(event.name().as_ref())?.to_string());
+            // Values are written anew, escaped for the quotes they get.
+            let mut keys = Vec::new();
             for attr in event.attributes() {
-                clean_event.push_attribute(attr.map_err(Error::InvalidAttr)?);
+                let attr = attr.map_err(Error::InvalidAttr)?;
+                let key = decoder.decode(attr.key.as_ref())?.into_owned();
+                clean_event.push_attribute((key.as_str(), self.convert_attribute(&attr)?.as_ref()));
+                keys.push(key);
             }
             if self.in_literal_depth == 0 {
+                // The namespaces in scope, unless the element declares them itself.
                 for (prefix, namespace) in self.reader.prefixes() {
-                    match prefix {
-                        PrefixDeclaration::Default => {
-                            clean_event.push_attribute(("xmlns".as_bytes(), namespace.into_inner()))
-                        }
+                    let key = match prefix {
+                        PrefixDeclaration::Default => "xmlns".to_owned(),
                         PrefixDeclaration::Named(name) => {
-                            let mut attr = Vec::with_capacity(6 + name.len());
-                            attr.extend_from_slice(b"xmlns:");
-                            attr.extend_from_slice(name);
-                            clean_event.push_attribute((attr.as_slice(), namespace.into_inner()))
+                            format!("xmlns:{}", decoder.decode(name)?)
                         }
+                    };
+                    if keys.contains(&key) {
+                        continue;
                     }
+                    let namespace = unescape_with(&decoder.decode(namespace.into_inner())?, |e| {
+                        self.resolve_entity(e)
+                    })
+                    .map_err(Error::from)?
+                    .into_owned();
+                    clean_event.push_attribute((key.as_str(), namespace.as_str()));
                 }
             }
+            let Some(RdfXmlState::ParseTypeLiteralPropertyElt { writer, .. }) =
+                self.state.last_mut()
+            else {
+                unreachable!()
+            };
             writer.write_event(Event::Start(clean_event))?;
             self.in_literal_depth += 1;
             return Ok(());
@@ -2127,5 +2141,42 @@ impl RdfVersion {
                 "The rdf:version value '{value}' is not supported, allowed values are '1.1' and '1.2'"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn xml_literal(content: &str) -> String {
+        let xml = format!(
+            r#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="http://example.com/s"><rdf:value rdf:parseType="Literal">{content}</rdf:value></rdf:Description>
+</rdf:RDF>"#
+        );
+        let triples: Vec<Triple> = RdfXmlParser::new()
+            .for_slice(&xml)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        match &triples[0].object {
+            Term::Literal(literal) => literal.value().to_owned(),
+            other => other.to_string(),
+        }
+    }
+
+    #[test]
+    fn xml_literal_attribute_values_are_escaped() {
+        assert_eq!(
+            xml_literal(r#"<x a='"' b="&lt;&amp;'"/>"#),
+            r#"<x a="&quot;" b="&lt;&amp;&apos;" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"></x>"#
+        );
+    }
+
+    #[test]
+    fn xml_literal_declares_each_namespace_once() {
+        assert_eq!(
+            xml_literal(r#"<x xmlns="urn:x" xmlns:rdf="urn:r"><y/></x>"#),
+            r#"<x xmlns="urn:x" xmlns:rdf="urn:r"><y></y></x>"#
+        );
     }
 }
