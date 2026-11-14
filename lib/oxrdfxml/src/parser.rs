@@ -984,7 +984,8 @@ impl<R> InternalRdfXmlParser<R> {
                 match attribute.key.local_name().as_ref() {
                     b"lang" => {
                         let tag = self.convert_attribute(&attribute)?.to_ascii_lowercase();
-                        language = Some(if self.lenient {
+                        // `xml:lang=""` is no tag: it takes away the language in scope.
+                        language = Some(if self.lenient || tag.is_empty() {
                             tag
                         } else {
                             LanguageTag::parse(tag.clone())
@@ -1812,9 +1813,10 @@ impl<R> InternalRdfXmlParser<R> {
     ) -> Literal {
         if let Some(datatype) = datatype {
             Literal::new_typed_literal(value, datatype)
-        } else if let Some(language) =
-            language.or_else(|| self.current_language().map(ToOwned::to_owned))
-        {
+        } else if let Some(language) = match language {
+            Some(language) => Some(language).filter(|language| !language.is_empty()),
+            None => self.current_language().map(ToOwned::to_owned),
+        } {
             #[cfg(feature = "rdf-12")]
             if let Some(base_direction) = base_direction {
                 return Literal::new_directional_language_tagged_literal_unchecked(
@@ -1889,7 +1891,10 @@ impl<R> InternalRdfXmlParser<R> {
                 Triple::new(
                     subject.clone(),
                     literal_predicate,
-                    if let Some(language) = language.or_else(|| self.current_language()) {
+                    if let Some(language) = match language {
+                        Some(language) => Some(language).filter(|language| !language.is_empty()),
+                        None => self.current_language(),
+                    } {
                         #[cfg(feature = "rdf-12")]
                         if let Some(base_direction) =
                             base_direction.or_else(|| self.current_base_direction())
@@ -1983,13 +1988,13 @@ impl<R> InternalRdfXmlParser<R> {
                 | RdfXmlState::ParseTypeCollectionPropertyElt { language, .. }
                 | RdfXmlState::ParseTypeLiteralPropertyElt { language, .. } => {
                     if let Some(language) = language {
-                        return Some(language);
+                        return Some(language.as_str()).filter(|language| !language.is_empty());
                     }
                 }
                 #[cfg(feature = "rdf-12")]
                 RdfXmlState::ParseTypeTriplePropertyElt { language, .. } => {
                     if let Some(language) = language {
-                        return Some(language);
+                        return Some(language.as_str()).filter(|language| !language.is_empty());
                     }
                 }
             }
@@ -2127,5 +2132,40 @@ impl RdfVersion {
                 "The rdf:version value '{value}' is not supported, allowed values are '1.1' and '1.2'"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod empty_language_tests {
+    use super::*;
+
+    fn parse(xml: &str) -> Result<Vec<Triple>, RdfXmlSyntaxError> {
+        RdfXmlParser::new().for_slice(xml).collect()
+    }
+
+    #[test]
+    fn empty_xml_lang_removes_the_language_in_scope() {
+        let triples = parse(
+            r#"<?xml version="1.0"?>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xml:lang="de">
+  <rdf:Description rdf:about="http://example.com/a">
+    <rdf:value xml:lang="">plain</rdf:value>
+    <rdf:value>german</rdf:value>
+  </rdf:Description>
+  <rdf:Description rdf:about="http://example.com/b" xml:lang="">
+    <rdf:value>plain</rdf:value>
+  </rdf:Description>
+</rdf:RDF>"#,
+        )
+        .unwrap();
+        let objects: Vec<Term> = triples.into_iter().map(|t| t.object).collect();
+        assert_eq!(
+            objects,
+            vec![
+                Literal::new_simple_literal("plain").into(),
+                Literal::new_language_tagged_literal_unchecked("german", "de").into(),
+                Literal::new_simple_literal("plain").into(),
+            ]
+        );
     }
 }
