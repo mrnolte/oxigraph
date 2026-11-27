@@ -900,7 +900,9 @@ impl<R> InternalRdfXmlParser<R> {
     }
 
     fn parse_doctype(&mut self, dt: &BytesText<'_>) -> Result<(), RdfXmlParseError> {
-        // we extract entities
+        // Entity values with character references resolved; their entity references are expanded
+        // once all declarations are known, so a value may refer to an entity declared after it.
+        let mut declared: Vec<(String, String)> = Vec::new();
         for input in dt.xml_content(self.xml_version)?.split('<').skip(1) {
             if let Some(input) = input.strip_prefix("!ENTITY") {
                 let input = input.trim_start().strip_prefix('%').unwrap_or(input);
@@ -921,14 +923,19 @@ impl<R> InternalRdfXmlParser<R> {
                     RdfXmlSyntaxError::msg("<!ENTITY declarations values should end with >")
                 })?;
 
-                // Resolves custom entities within the current entity definition.
-                let entity_value = unescape_with(entity_value, |e| self.custom_entities.resolve(e))
-                    .map_err(Error::from)?;
-                self.custom_entities
-                    .0
-                    .insert(entity_name.to_owned(), entity_value.to_string());
+                // Entity references stay as they are: they are bypassed in an entity value.
+                let references: HashMap<&str, String> = entity_references(entity_value)
+                    .map(|name| (name, format!("&{name};")))
+                    .collect();
+                let entity_value =
+                    unescape_with(entity_value, |e| references.get(e).map(String::as_str))
+                        .map_err(Error::from)?;
+                if !declared.iter().any(|(name, _)| name == entity_name) {
+                    declared.push((entity_name.to_owned(), entity_value.into_owned()));
+                }
             }
         }
+        self.custom_entities = EntityRegistry(expand_entities(&declared));
         Ok(())
     }
 
@@ -956,36 +963,49 @@ impl<R> InternalRdfXmlParser<R> {
         }
 
         // Literal case
-        if let Some(RdfXmlState::ParseTypeLiteralPropertyElt { writer, .. }) = self.state.last_mut()
-        {
-            let mut clean_event = BytesStart::new(
-                self.reader
-                    .decoder()
-                    .decode(event.name().as_ref())?
-                    .to_string(),
-            );
+        if matches!(
+            self.state.last(),
+            Some(RdfXmlState::ParseTypeLiteralPropertyElt { .. })
+        ) {
+            let decoder = self.reader.decoder();
+            let mut clean_event =
+                BytesStart::new(decoder.decode(event.name().as_ref())?.to_string());
+            // Values are written anew, escaped for the quotes they get.
+            let mut keys = Vec::new();
             for attr in event.attributes() {
-                clean_event.push_attribute(attr.map_err(Error::InvalidAttr)?);
+                let attr = attr.map_err(Error::InvalidAttr)?;
+                let key = decoder.decode(attr.key.as_ref())?.into_owned();
+                clean_event.push_attribute((key.as_str(), self.convert_attribute(&attr)?.as_ref()));
+                keys.push(key);
             }
             if self.in_literal_depth == 0 {
+                // The namespaces in scope, unless the element declares them itself.
                 for (prefix, namespace) in self.reader.resolver().bindings() {
-                    let namespace = self.reader.decoder().decode(namespace.into_inner())?;
-                    if let Err(error) = Iri::parse(namespace.as_ref()) {
-                        return Err(RdfXmlSyntaxError::invalid_iri(namespace.into(), error).into());
-                    }
-                    match prefix {
-                        PrefixDeclaration::Default => {
-                            clean_event.push_attribute(("xmlns".as_bytes(), namespace.as_bytes()))
-                        }
+                    let key = match prefix {
+                        PrefixDeclaration::Default => "xmlns".to_owned(),
                         PrefixDeclaration::Named(name) => {
-                            let mut attr = Vec::with_capacity(6 + name.len());
-                            attr.extend_from_slice(b"xmlns:");
-                            attr.extend_from_slice(name);
-                            clean_event.push_attribute((attr.as_slice(), namespace.as_bytes()))
+                            format!("xmlns:{}", decoder.decode(name)?)
                         }
+                    };
+                    if keys.contains(&key) {
+                        continue;
                     }
+                    let namespace = unescape_with(&decoder.decode(namespace.into_inner())?, |e| {
+                        self.custom_entities.resolve(e)
+                    })
+                    .map_err(Error::from)?
+                    .into_owned();
+                    if let Err(error) = Iri::parse(namespace.as_str()) {
+                        return Err(RdfXmlSyntaxError::invalid_iri(namespace, error).into());
+                    }
+                    clean_event.push_attribute((key.as_str(), namespace.as_str()));
                 }
             }
+            let Some(RdfXmlState::ParseTypeLiteralPropertyElt { writer, .. }) =
+                self.state.last_mut()
+            else {
+                unreachable!()
+            };
             writer.write_event(Event::Start(clean_event))?;
             self.in_literal_depth += 1;
             return Ok(());
@@ -1024,7 +1044,8 @@ impl<R> InternalRdfXmlParser<R> {
                 match attribute.key.local_name().as_ref() {
                     b"lang" => {
                         let tag = self.convert_attribute(&attribute)?.to_ascii_lowercase();
-                        language = Some(if self.lenient {
+                        // `xml:lang=""` is no tag: it takes away the language in scope.
+                        language = Some(if self.lenient || tag.is_empty() {
                             tag
                         } else {
                             LanguageTag::parse(tag.clone())
@@ -1502,6 +1523,7 @@ impl<R> InternalRdfXmlParser<R> {
     }
 
     fn parse_text_event(&mut self, text: String) -> Result<(), RdfXmlParseError> {
+        self.check_chars(&text)?;
         match self.state.last_mut() {
             Some(RdfXmlState::PropertyElt { object, .. }) => {
                 if is_object_defined(object) {
@@ -1851,8 +1873,9 @@ impl<R> InternalRdfXmlParser<R> {
     ) -> Literal {
         if let Some(datatype) = datatype {
             Literal::new_typed_literal(value, datatype)
-        } else if let Some(language) =
-            language.or_else(|| self.current_language().map(ToOwned::to_owned))
+        } else if let Some(language) = language
+            .or_else(|| self.current_language().map(ToOwned::to_owned))
+            .filter(|language| !language.is_empty())
         {
             #[cfg(feature = "rdf-12")]
             if let Some(base_direction) = base_direction {
@@ -1928,7 +1951,10 @@ impl<R> InternalRdfXmlParser<R> {
                 Triple::new(
                     subject.clone(),
                     literal_predicate,
-                    if let Some(language) = language.or_else(|| self.current_language()) {
+                    if let Some(language) = language
+                        .or_else(|| self.current_language())
+                        .filter(|language| !language.is_empty())
+                    {
                         #[cfg(feature = "rdf-12")]
                         if let Some(base_direction) =
                             base_direction.or_else(|| self.current_base_direction())
@@ -1969,12 +1995,26 @@ impl<R> InternalRdfXmlParser<R> {
         &self,
         attribute: &Attribute<'a>,
     ) -> Result<Cow<'a, str>, RdfXmlParseError> {
-        Ok(attribute.decoded_and_normalized_value_with(
+        let value = attribute.decoded_and_normalized_value_with(
             self.xml_version,
             self.reader.decoder(),
             MAX_ENTITY_NESTING,
             |e| self.custom_entities.resolve(e),
-        )?)
+        )?;
+        self.check_chars(&value)?;
+        Ok(value)
+    }
+
+    /// Fails if `text`, with its references resolved, has a character XML does not allow,
+    /// unless the parser is lenient.
+    fn check_chars(&self, text: &str) -> Result<(), RdfXmlSyntaxError> {
+        match text.chars().find(|c| !is_char(*c, self.xml_version)) {
+            Some(c) if !self.lenient => Err(RdfXmlSyntaxError::msg(format!(
+                "The character U+{:04X} is not allowed in XML",
+                u32::from(c)
+            ))),
+            _ => Ok(()),
+        }
     }
 
     fn convert_iri_attribute(
@@ -2026,13 +2066,13 @@ impl<R> InternalRdfXmlParser<R> {
                 | RdfXmlState::ParseTypeCollectionPropertyElt { language, .. }
                 | RdfXmlState::ParseTypeLiteralPropertyElt { language, .. } => {
                     if let Some(language) = language {
-                        return Some(language);
+                        return Some(language.as_str()).filter(|language| !language.is_empty());
                     }
                 }
                 #[cfg(feature = "rdf-12")]
                 RdfXmlState::ParseTypeTriplePropertyElt { language, .. } => {
                     if let Some(language) = language {
-                        return Some(language);
+                        return Some(language.as_str()).filter(|language| !language.is_empty());
                     }
                 }
             }
@@ -2137,6 +2177,91 @@ impl EntityRegistry {
     }
 }
 
+/// The names of the entity references (`&name;`, not character references) in `value`.
+fn entity_references(value: &str) -> impl Iterator<Item = &str> {
+    value.split('&').skip(1).filter_map(|after| {
+        let name = &after[..after.find(';')?];
+        (!name.starts_with('#')).then_some(name)
+    })
+}
+
+/// The longest replacement text of an entity.
+const MAX_ENTITY_SIZE: usize = 1024 * 1024;
+/// The longest replacement texts of all entities together, against exponential expansion.
+const MAX_ENTITIES_SIZE: usize = 16 * 1024 * 1024;
+/// The longest chain of entities referring to each other.
+const MAX_ENTITY_DEPTH: usize = 64;
+
+/// The entities of `declared` (in declaration order) with their entity references expanded.
+/// An entity that refers to itself, to an undeclared entity, or whose expansion is too long or
+/// too deep is left out, so using it is an error. Entities are expanded in dependency order,
+/// without recursion, and among the ready ones in declaration order, so that the limits always
+/// leave out the same entities.
+fn expand_entities(declared: &[(String, String)]) -> HashMap<String, String> {
+    let references = |value: &str| -> Vec<String> {
+        let mut names: Vec<String> = entity_references(value)
+            .filter(|name| resolve_xml_entity(name).is_none())
+            .map(str::to_owned)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    };
+    let mut waiting = vec![0; declared.len()];
+    let mut dependents: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut ready = std::collections::BTreeSet::new();
+    for (i, (_, value)) in declared.iter().enumerate() {
+        let names = references(value);
+        waiting[i] = names.len();
+        if names.is_empty() {
+            ready.insert(i);
+        }
+        for name in names {
+            dependents.entry(name).or_default().push(i);
+        }
+    }
+    let mut expanded: HashMap<String, String> = HashMap::new();
+    let mut depth: HashMap<&str, usize> = HashMap::new();
+    let mut total = 0;
+    while let Some(i) = ready.pop_first() {
+        let (name, value) = &declared[i];
+        let names = references(value);
+        // The size is known before the text is built: the value plus what each reference stands for.
+        let all_known = names.iter().all(|n| expanded.contains_key(n));
+        let size = value.len()
+            + entity_references(value)
+                .map(|n| expanded.get(n).map_or(0, String::len))
+                .sum::<usize>();
+        let own_depth = 1 + names
+            .iter()
+            .map(|n| depth.get(n.as_str()).copied().unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+        if all_known
+            && size <= MAX_ENTITY_SIZE
+            && total + size <= MAX_ENTITIES_SIZE
+            && own_depth <= MAX_ENTITY_DEPTH
+        {
+            if let Ok(text) = unescape_with(value, |e| {
+                resolve_xml_entity(e).or_else(|| expanded.get(e).map(String::as_str))
+            }) {
+                let text = text.into_owned();
+                total += text.len();
+                expanded.insert(name.clone(), text);
+                depth.insert(name, own_depth);
+            }
+        }
+        // Dependents of an entity left out are left out too: they wait on it no more, but miss it.
+        for &dependent in dependents.get(name).into_iter().flatten() {
+            waiting[dependent] -= 1;
+            if waiting[dependent] == 0 {
+                ready.insert(dependent);
+            }
+        }
+    }
+    expanded
+}
+
 fn is_object_defined(object: &Option<NodeOrText>) -> bool {
     match object {
         Some(NodeOrText::Node(_)) => true,
@@ -2188,5 +2313,189 @@ impl RdfVersion {
                 "The rdf:version value '{value}' is not supported, allowed values are '1.1' and '1.2'"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(xml: &str) -> Result<Vec<Triple>, RdfXmlSyntaxError> {
+        RdfXmlParser::new().for_slice(xml).collect()
+    }
+
+    #[test]
+    fn entity_may_refer_to_a_later_entity() {
+        let triples = parse(
+            r#"<?xml version="1.0"?>
+<!DOCTYPE rdf:RDF [
+  <!ENTITY a "&b;a">
+  <!ENTITY b "http://example.com/">
+]>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="&a;"><rdf:value>&a;</rdf:value></rdf:Description>
+</rdf:RDF>"#,
+        )
+        .unwrap();
+        assert_eq!(triples.len(), 1);
+        assert_eq!(
+            triples[0].subject,
+            NamedNode::new_unchecked("http://example.com/a").into()
+        );
+        assert_eq!(
+            triples[0].object,
+            Literal::new_simple_literal("http://example.com/a").into()
+        );
+    }
+
+    #[test]
+    fn recursive_entity_is_an_error_when_used() {
+        parse(
+            r#"<!DOCTYPE rdf:RDF [
+  <!ENTITY a "&b;">
+  <!ENTITY b "&a;">
+]>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="http://example.com/s"><rdf:value>&a;</rdf:value></rdf:Description>
+</rdf:RDF>"#,
+        )
+        .unwrap_err();
+    }
+
+    #[test]
+    fn entity_expansion_is_bounded() {
+        let parse_with = |dtd: &str, name: &str| {
+            parse(&format!(
+                r#"<!DOCTYPE rdf:RDF [{dtd}]>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="http://example.com/s"><rdf:value>&{name};</rdf:value></rdf:Description>
+</rdf:RDF>"#
+            ))
+        };
+        let chain: String = std::iter::once("<!ENTITY e0 \"x\">".to_owned())
+            .chain((1..10_000).map(|i| format!("<!ENTITY e{i} \"&e{};\">", i - 1)))
+            .collect();
+        parse_with(&chain, "e1").unwrap();
+        parse_with(&chain, "e9999").unwrap_err();
+        let fan: String = std::iter::once("<!ENTITY f0 \"0123456789\">".to_owned())
+            .chain((1..40).map(|i| format!("<!ENTITY f{i} \"&f{0};&f{0};\">", i - 1)))
+            .collect();
+        parse_with(&fan, "f1").unwrap();
+        parse_with(&fan, "f39").unwrap_err();
+    }
+
+    #[test]
+    fn first_entity_declaration_is_binding() {
+        let triples = parse(
+            r#"<!DOCTYPE rdf:RDF [
+  <!ENTITY a "first">
+  <!ENTITY a "second">
+]>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="http://example.com/s"><rdf:value>&a;</rdf:value></rdf:Description>
+</rdf:RDF>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            triples[0].object,
+            Literal::new_simple_literal("first").into()
+        );
+    }
+
+    fn with_value(value: &str) -> String {
+        format!(
+            r#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="http://example.com/s" rdf:value="{value}"><rdf:value>{value}</rdf:value></rdf:Description>
+</rdf:RDF>"#
+        )
+    }
+
+    #[test]
+    fn reference_to_a_character_xml_forbids_is_an_error() {
+        for reference in ["&#1;", "&#x0;", "&#xFFFE;", "&#xFFFF;", "&#xD800;"] {
+            parse(&with_value(&format!("a{reference}b"))).unwrap_err();
+        }
+    }
+
+    #[test]
+    fn character_xml_forbids_is_an_error() {
+        parse(&with_value("a\u{1}b")).unwrap_err();
+    }
+
+    #[test]
+    fn references_to_allowed_characters_are_read() {
+        let triples = parse(&with_value(
+            "&#9;&#xA;&#xD;&#x20;&#xD7FF;&#xE000;&#xFFFD;&#x10000;&#x10FFFF;",
+        ))
+        .unwrap();
+        assert_eq!(triples.len(), 2);
+    }
+
+    #[test]
+    fn lenient_parser_reads_forbidden_characters() {
+        let triples: Vec<Triple> = RdfXmlParser::new()
+            .lenient()
+            .for_slice(&with_value("a&#1;b"))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(triples.len(), 2);
+    }
+
+    fn xml_literal(content: &str) -> String {
+        let xml = format!(
+            r#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="http://example.com/s"><rdf:value rdf:parseType="Literal">{content}</rdf:value></rdf:Description>
+</rdf:RDF>"#
+        );
+        let triples: Vec<Triple> = RdfXmlParser::new()
+            .for_slice(&xml)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        match &triples[0].object {
+            Term::Literal(literal) => literal.value().to_owned(),
+            other => other.to_string(),
+        }
+    }
+
+    #[test]
+    fn xml_literal_attribute_values_are_escaped() {
+        assert_eq!(
+            xml_literal(r#"<x a='"' b="&lt;&amp;'"/>"#),
+            r#"<x a="&quot;" b="&lt;&amp;&apos;" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"></x>"#
+        );
+    }
+
+    #[test]
+    fn xml_literal_declares_each_namespace_once() {
+        assert_eq!(
+            xml_literal(r#"<x xmlns="urn:x" xmlns:rdf="urn:r"><y/></x>"#),
+            r#"<x xmlns="urn:x" xmlns:rdf="urn:r"><y></y></x>"#
+        );
+    }
+
+    #[test]
+    fn empty_xml_lang_removes_the_language_in_scope() {
+        let triples = parse(
+            r#"<?xml version="1.0"?>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xml:lang="de">
+  <rdf:Description rdf:about="http://example.com/a">
+    <rdf:value xml:lang="">plain</rdf:value>
+    <rdf:value>german</rdf:value>
+  </rdf:Description>
+  <rdf:Description rdf:about="http://example.com/b" xml:lang="">
+    <rdf:value>plain</rdf:value>
+  </rdf:Description>
+</rdf:RDF>"#,
+        )
+        .unwrap();
+        let objects: Vec<Term> = triples.into_iter().map(|t| t.object).collect();
+        assert_eq!(
+            objects,
+            vec![
+                Literal::new_simple_literal("plain").into(),
+                Literal::new_language_tagged_literal_unchecked("german", "de").into(),
+                Literal::new_simple_literal("plain").into(),
+            ]
+        );
     }
 }
