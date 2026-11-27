@@ -1512,6 +1512,7 @@ impl<R> InternalRdfXmlParser<R> {
     }
 
     fn parse_text_event(&mut self, text: String) -> Result<(), RdfXmlParseError> {
+        self.check_chars(&text)?;
         match self.state.last_mut() {
             Some(RdfXmlState::PropertyElt { object, .. }) => {
                 if is_object_defined(object) {
@@ -1979,12 +1980,26 @@ impl<R> InternalRdfXmlParser<R> {
         &self,
         attribute: &Attribute<'a>,
     ) -> Result<Cow<'a, str>, RdfXmlParseError> {
-        Ok(attribute.decoded_and_normalized_value_with(
+        let value = attribute.decoded_and_normalized_value_with(
             self.xml_version,
             self.reader.decoder(),
             MAX_ENTITY_NESTING,
             |e| self.custom_entities.resolve(e),
-        )?)
+        )?;
+        self.check_chars(&value)?;
+        Ok(value)
+    }
+
+    /// Fails if `text`, with its references resolved, has a character XML does not allow,
+    /// unless the parser is lenient.
+    fn check_chars(&self, text: &str) -> Result<(), RdfXmlSyntaxError> {
+        match text.chars().find(|c| !is_char(*c, self.xml_version)) {
+            Some(c) if !self.lenient => Err(RdfXmlSyntaxError::msg(format!(
+                "The character U+{:04X} is not allowed in XML",
+                u32::from(c)
+            ))),
+            _ => Ok(()),
+        }
     }
 
     fn convert_iri_attribute(
@@ -2239,5 +2254,53 @@ impl RdfVersion {
                 "The rdf:version value '{value}' is not supported, allowed values are '1.1' and '1.2'"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(xml: &str) -> Result<Vec<Triple>, RdfXmlSyntaxError> {
+        RdfXmlParser::new().for_slice(xml).collect()
+    }
+
+    fn with_value(value: &str) -> String {
+        format!(
+            r#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="http://example.com/s" rdf:value="{value}"><rdf:value>{value}</rdf:value></rdf:Description>
+</rdf:RDF>"#
+        )
+    }
+
+    #[test]
+    fn reference_to_a_character_xml_forbids_is_an_error() {
+        for reference in ["&#1;", "&#x0;", "&#xFFFE;", "&#xFFFF;", "&#xD800;"] {
+            parse(&with_value(&format!("a{reference}b"))).unwrap_err();
+        }
+    }
+
+    #[test]
+    fn character_xml_forbids_is_an_error() {
+        parse(&with_value("a\u{1}b")).unwrap_err();
+    }
+
+    #[test]
+    fn references_to_allowed_characters_are_read() {
+        let triples = parse(&with_value(
+            "&#9;&#xA;&#xD;&#x20;&#xD7FF;&#xE000;&#xFFFD;&#x10000;&#x10FFFF;",
+        ))
+        .unwrap();
+        assert_eq!(triples.len(), 2);
+    }
+
+    #[test]
+    fn lenient_parser_reads_forbidden_characters() {
+        let triples: Vec<Triple> = RdfXmlParser::new()
+            .lenient()
+            .for_slice(&with_value("a&#1;b"))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(triples.len(), 2);
     }
 }

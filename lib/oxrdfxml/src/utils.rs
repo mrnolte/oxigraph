@@ -1,3 +1,5 @@
+use quick_xml::XmlVersion;
+
 pub fn is_name(name: &str) -> bool {
     // NameStartChar (NameChar)*
     let mut c = name.chars();
@@ -37,4 +39,11 @@ pub fn is_name_char(c: char) -> bool {
     // NameStartChar | "-" | "." | [0-9] | #xB7 | [#x0300-#x036F] | [#x203F-#x2040]
     is_name_start_char(c)
         || matches!(c,  '-' | '.' | '0'..='9' | '\u{B7}' | '\u{0300}'..='\u{036F}' | '\u{203F}'..='\u{2040}')
+}
+
+pub fn is_char(c: char, version: XmlVersion) -> bool {
+    // XML 1.0: #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+    // XML 1.1: [#x1-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+    matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}')
+        || (matches!(version, XmlVersion::Explicit1_1) && matches!(c, '\u{1}'..='\u{1F}'))
 }
