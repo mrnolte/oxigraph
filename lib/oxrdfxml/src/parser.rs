@@ -2348,4 +2348,86 @@ mod tests {
             r#"<x xmlns="urn:x" xmlns:rdf="urn:r"><y></y></x>"#
         );
     }
+
+    #[test]
+    fn entity_may_refer_to_a_later_entity() {
+        let triples = parse(
+            r#"<?xml version="1.0"?>
+<!DOCTYPE rdf:RDF [
+  <!ENTITY a "&b;a">
+  <!ENTITY b "http://example.com/">
+]>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="&a;"><rdf:value>&a;</rdf:value></rdf:Description>
+</rdf:RDF>"#,
+        )
+        .unwrap();
+        assert_eq!(triples.len(), 1);
+        assert_eq!(
+            triples[0].subject,
+            NamedNode::new_unchecked("http://example.com/a").into()
+        );
+        assert_eq!(
+            triples[0].object,
+            Literal::new_simple_literal("http://example.com/a").into()
+        );
+    }
+
+    #[test]
+    fn recursive_entity_is_an_error() {
+        parse(
+            r#"<!DOCTYPE rdf:RDF [
+  <!ENTITY a "&b;">
+  <!ENTITY b "&a;">
+]>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="http://example.com/s"><rdf:value>&a;</rdf:value></rdf:Description>
+</rdf:RDF>"#,
+        )
+        .unwrap_err();
+    }
+
+    #[test]
+    fn first_entity_declaration_is_binding() {
+        let triples = parse(
+            r#"<!DOCTYPE rdf:RDF [
+  <!ENTITY a "first">
+  <!ENTITY a "second">
+]>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="http://example.com/s"><rdf:value>&a;</rdf:value></rdf:Description>
+</rdf:RDF>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            triples[0].object,
+            Literal::new_simple_literal("first").into()
+        );
+    }
+
+    #[test]
+    fn empty_xml_lang_removes_the_language_in_scope() {
+        let triples = parse(
+            r#"<?xml version="1.0"?>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xml:lang="de">
+  <rdf:Description rdf:about="http://example.com/a">
+    <rdf:value xml:lang="">plain</rdf:value>
+    <rdf:value>german</rdf:value>
+  </rdf:Description>
+  <rdf:Description rdf:about="http://example.com/b" xml:lang="">
+    <rdf:value>plain</rdf:value>
+  </rdf:Description>
+</rdf:RDF>"#,
+        )
+        .unwrap();
+        let objects: Vec<Term> = triples.into_iter().map(|t| t.object).collect();
+        assert_eq!(
+            objects,
+            vec![
+                Literal::new_simple_literal("plain").into(),
+                Literal::new_language_tagged_literal_unchecked("german", "de").into(),
+                Literal::new_simple_literal("plain").into(),
+            ]
+        );
+    }
 }
